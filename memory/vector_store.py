@@ -41,16 +41,21 @@ def create_store(connection):
     """
 
     perm_mem_query = """
-    CREATE TABLE IF NOT EXISTS perm_memory (
-    id INTEGER PRIMARY KEY,
-    fact TEXT
-    )
+    CREATE TABLE IF NOT EXISTS perm_memory (fact TEXT)
     """
 
     lesson_query = """
-    CREATE TABLE IF NOT EXISTS lessons (
+    CREATE TABLE IF NOT EXISTS lessons (lesson TEXT)
+    """
+
+    semantic_mem_query = """
+    CREATE TABLE IF NOT EXISTS chunks (chunk TEXT)
+    """
+
+    semantic_vec_query = """
+    CREATE VIRTUAL TABLE IF NOT EXISTS sem_vecs USING vec0 (
     id INTEGER PRIMARY KEY,
-    lesson TEXT
+    embedding float[384] distance_metric=cosine
     )
     """
 
@@ -61,9 +66,12 @@ def create_store(connection):
             connection.execute(perm_mem_query)
             connection.execute(keyword_query)
             connection.execute(lesson_query)
-
+            connection.execute(semantic_mem_query)
+            connection.execute(semantic_vec_query)
+        return ""
     except Exception as e:
         print(f"Error: {e}")
+        return f"Error: {e}"
 
 def store_perm_mem (connection, fact:str, type:str):
     if type == "FACT":
@@ -73,8 +81,10 @@ def store_perm_mem (connection, fact:str, type:str):
     try:
         with connection:
             connection.execute(query, (fact,))
+        return ""
     except Exception as e:
         print(f"Error: {e}")
+        return f"Error: {e}"
 
 def load_perm_mem (connection, type:str):
     if type == "FACT":
@@ -100,10 +110,26 @@ def add_chat(connection, exchange:str, session_id:str, turn_index:int, embedding
             new_id = cursor.lastrowid
             connection.execute(vec_query, (new_id, embedding))
             connection.execute(keyword_query, (new_id, exchange))
+        return ""
     except Exception as e:
         print(f"Error: {e}")
+        return f"Error: {e}"
 
-def semantic_search(connection, model, text, top_k=15, max_distance=.75):
+def add_semantic_memory(connection, text:str, embedding):
+    query = "INSERT INTO chunks (chunk) VALUES (?)"
+    vec_query = "INSERT INTO sem_vecs (id, embedding) VALUES (?,?)"
+
+    try:
+        with connection:
+            cursor = connection.execute(query, (text,))
+            new_id = cursor.lastrowid
+            connection.execute(vec_query, (new_id, embedding))
+        return ""
+    except Exception as e:
+        print(f"Error: {e}")
+        return f"Error: {e}"
+
+def mem_search(connection, model, text, top_k=15, max_distance=.75):
     embedding = model.encode(text)
 
     rows = connection.execute(
@@ -120,6 +146,23 @@ def semantic_search(connection, model, text, top_k=15, max_distance=.75):
     # 1) Keep only rows within the distance threshold
     filtered = [row[4] for row in rows if row[3] <= max_distance]
     return filtered
+
+def semantic_search(connection, model, text, exclude_ids, top_k=2, max_distance=.75):
+    embedding = model.encode(text)
+    exclude_ids = exclude_ids or []
+    placeholders = ",".join("?" * len(exclude_ids))
+
+    rows = connection.execute(
+        f"""
+        SELECT chunks.chunk, v.distance, chunks.rowid
+        FROM (SELECT id, distance FROM sem_vecs WHERE embedding MATCH ? AND k = ? AND id NOT IN ({placeholders})) AS v
+        JOIN chunks ON chunks.rowid = v.id
+        """,
+        (embedding, top_k, *exclude_ids)).fetchall()
+
+    filtered = [(row[0], row[1], row[2]) for row in rows if row[1] <= max_distance]
+    return filtered
+
 
 def keyword_search(connection, keywords, top_k=15):
     # Defensive guard: FTS5 MATCH treats multiple space-separated terms as an

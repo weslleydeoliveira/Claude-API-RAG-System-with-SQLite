@@ -3,15 +3,15 @@ import anthropic
 from pathlib import Path
 from dotenv import load_dotenv
 import os
-from memory.vector_store import add_chat, semantic_search, load_perm_mem, store_perm_mem, keyword_search, rrf
+from memory.vector_store import add_chat, mem_search, load_perm_mem, store_perm_mem, keyword_search, rrf, add_semantic_memory, semantic_search
 
 load_dotenv(Path(__file__).parent / "config" / ".env")
 api_key=os.getenv("ANTHROPIC_API_KEY")
 client = anthropic.Anthropic(api_key=api_key)
 
-memory_schema = {
+episodic_schema = {
     "name": "recall_memory",
-    "description": "If user references something from the past, or asks if you remember something, search past chats for relevant context and/or memories. Don't be TOO specific with queries or you lose good candidates, but not TOO general to get a hit on everything. Call this for every NEW topic about the past, even if you have some info on it",
+    "description": "If user references something from the past, or asks if you remember something, search past chats for relevant context and/or memories. Don't be TOO specific with queries or you lose good candidates, but not TOO general to get a hit on everything. Call this for every NEW topic about the past, even if you have some info on it.",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -24,7 +24,7 @@ memory_schema = {
 
 perm_mem_schema = {
     "name": "store_perm_mem",
-    "description": "If you receive a fact about the user, their preferences, opinion, etc, or the user corrects you on something, store that lesson/fact in permanent memory.",
+    "description": "If you receive a fact ABOUT THE USER, their preferences, opinion, etc, store that fact in permanent memory.",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -43,6 +43,30 @@ lesson_schema = {
             "lesson": {"type": "string", "description": "The corrected behavior, stated as a rule to follow going forward"}
         },
         "required": ["lesson"]
+    }
+}
+
+add_semantic_mem = {
+    "name": "store_sem_mem",
+    "description": "If the user asks to store a fact that is not necessarily about them or a preference/opinion, store in semantic memory.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "memory": {"type": "string", "description": "The memory asked to be stored"}
+        },
+        "required": ["memory"]
+    }
+}
+
+search_semantic_mem = {
+    "name": "search_semantic",
+    "description": "Always use this tool FOR EVERY response to see if there is any relevant memory",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What to search for. Generated based on but not worded exactly like the user prompt"}
+        },
+        "required": ["query"]
     }
 }
 
@@ -72,6 +96,7 @@ def chat(connection, model):
 
     session_id = uuid.uuid4()
     messages = []
+    seen_chunk_ids = set()
 
     print("Type 'exit' to end chat\n")
 
@@ -95,20 +120,32 @@ def chat(connection, model):
         if user == "exit":
             return format_conversation(messages)
 
+        
+
         while True:
             response = client.messages.create(
                 model="claude-haiku-4-5",
                 system=f"Durable facts you've been told to remember (doesn't replace searching for memory): {load_perm_mem(connection, "FACT")}\nLessons you've learned: {load_perm_mem(connection, "LESSON")}",
                 messages=messages,
-                tools=[memory_schema, perm_mem_schema, lesson_schema],
+                tools=[episodic_schema, perm_mem_schema, lesson_schema, add_semantic_mem, search_semantic_mem],
                 max_tokens=1000
             )
 
+            # This can probably be moved to the main tool use stop reason section
             if response.stop_reason == "tool_use":
                 # Drop preamble text blocks (e.g. narration like "Let me search my
                 # memory...") and keep only the tool_use blocks, so filler text
                 # doesn't later get embedded into the exchange via format_conversation.
-                assistant_content = [b for b in response.content if b.type == "tool_use"]
+                tool_use_blocks = [b for b in response.content if b.type == "tool_use"]
+
+                # Episodic (recall_memory) and semantic (search_semantic) memory are
+                # exclusive -- if both were requested, drop search_semantic entirely
+                # so it's as if Claude never called it, and it never needs a tool_result.
+                tool_use_names = [b.name for b in tool_use_blocks]
+                if "recall_memory" in tool_use_names and "search_semantic" in tool_use_names:
+                    tool_use_blocks = [b for b in tool_use_blocks if b.name != "search_semantic"]
+
+                assistant_content = tool_use_blocks
             else:
                 # end_turn (or any other stop reason): keep content unchanged,
                 # since this is the real final answer text.
@@ -123,11 +160,13 @@ def chat(connection, model):
                 break
 
             elif response.stop_reason == "tool_use":
+                print(f"DEBUG: tool_use blocks in this response = {[b.name for b in assistant_content]}")
+
                 # Every tool_use block in this response needs its own tool_result --
                 # collecting into a list (instead of overwriting a single tool_id)
                 # keeps responses with multiple simultaneous tool_use blocks valid.
                 tool_result_blocks = []
-                for object in response.content:
+                for object in assistant_content:
                     if object.type == "tool_use":
                         # Each branch sets its own local result_text so tool calls
                         # never share or leak each other's result content.
@@ -135,7 +174,7 @@ def chat(connection, model):
                             used_recall_memory = True
                             print("Attempting to pull from memory\n")
                             print(f"DEBUG: raw tool_use input query={object.input['query']!r}, keywords={object.input['keywords']!r}")
-                            sem_search_results = semantic_search(connection, model, object.input["query"])
+                            sem_search_results = mem_search(connection, model, object.input["query"])
                             print(f"DEBUG: vec search ids = {sem_search_results}")
                             keyword_search_results = keyword_search(connection, object.input["keywords"])
                             print(f"DEBUG: keyword search ids = {keyword_search_results}")
@@ -151,13 +190,32 @@ def chat(connection, model):
 
                         elif object.name == "store_perm_mem":
                             print(f"Storing permanent memory: {object.input["fact"]}\n")
-                            store_perm_mem(connection, object.input["fact"], "FACT")
-                            result_text = "Fact stored."
+                            error = store_perm_mem(connection, object.input["fact"], "FACT")
+                            if error: result_text = error
+                            else: result_text = "Fact stored."
 
                         elif object.name == "store_lesson":
                             print(f"Storing lesson: {object.input["lesson"]}\n")
-                            store_perm_mem(connection, object.input["lesson"], "LESSON")
-                            result_text = "Lesson stored"
+                            error = store_perm_mem(connection, object.input["lesson"], "LESSON")
+                            if error: result_text = error
+                            else: result_text = "Lesson stored"
+
+                        elif object.name == "store_sem_mem":
+                            print(f"Storing semantic memory: {object.input["memory"]}\n")
+                            embedding = model.encode(object.input["memory"])
+                            error = add_semantic_memory(connection, object.input["memory"], embedding)
+                            if error: result_text = error
+                            else: result_text = "Semantic memory stored"
+
+                        elif object.name == "search_semantic":
+                            print(f"Searching semantic memory\n")
+                            semantic_results = semantic_search(connection, model, object.input["query"], seen_chunk_ids)
+                            print(f"DEBUG: semantic search results (chunk, score) = {[(chunk, score) for chunk, score, _ in semantic_results]}\n")
+                            result_text = "\n---\n".join(
+                                f"[Memory {i+1}, score={score:.4f}]\n{chunk}"
+                                for i, (chunk, score, id) in enumerate(semantic_results)
+                            )
+                            seen_chunk_ids.update(chunk_id for _, _, chunk_id in semantic_results)
 
                         tool_result_blocks.append({
                             "type": "tool_result",
@@ -167,6 +225,8 @@ def chat(connection, model):
 
                 messages.append({"role": "user", "content": tool_result_blocks})
 
+        # We don't want to add exchanges that were recalling memories into the db, or those will become
+        # the best scoring semantic results
         if not used_recall_memory:
             exchange = format_conversation(messages[turn_start_index:])
             embedding = model.encode(exchange)
