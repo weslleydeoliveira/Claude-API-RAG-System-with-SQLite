@@ -62,11 +62,21 @@ This is memory that is injected into the system prompt at the beginning of every
 
 This is Semantic Memory that we *actually* search semantically. After every user prompt, the `search_semantic_mem` tool instructs the LLM to search semantic memory for relevant context that could be used for to answer the prompt.
 
-Since semantic memory is pulled every chat, there is a dedup mechanism in place that keeps track of all chunks currently in context and doesn't allow any duplicates to enter. 
-
 (Chunking is not currently implemented)
 
 (Episodic promotion is not yet implemented)
+
+## Memory diagram:
+
+![Tool Diagram](assets/mem-diagram.png)
+
+### Dedup
+
+Since either semantic or episodic memory are pulled every chat, there is a dedup mechanism in place that keeps track of all chunks/exchanges currently in context and doesn't allow any duplicates to enter.
+
+There is a specific case when the user tries to recall a memory a second time (Episodic), and if the memories that surface are all in context already, the model describes that that topic has never surfaced. So, after every recall, we run the same query again with an empty "seen" list and that gives us two possibilities:
+1. The result is still empty. The dedup did nothing, and the model *should* say the conversation has never happened.
+2. The result is not empty. The dedup worked and the model should instead say that there are no further memories.
 
 ## Claude Messages API
 
@@ -90,7 +100,7 @@ Since semantic memory is pulled every chat, there is a dedup mechanism in place 
 - Querying
     - The `sqlite-vec` extension adds vector similarity search directly to SQLite through a virtual table (`vec0`), so embeddings can be stored and queried without standing up a separate vector database.
         - We use cosine as the distance metric to be able to intuitively understand whether a score is good or bad.
-        - The threshold for returned chats is hardcoded at .75, but there is no right answer. The threshold at .75-.9 is what i found works best for me.
+        - The threshold for returned chats is hardcoded at .5, but there is no right answer. The threshold at .4-.7 is what i found works best for me.
     - The `FTS5` built in extension provides the functionality for keyword searching, using `BM25` for relevance scoring.
     - Seven tables support the two memory types: `exchanges` stores the raw text of each conversation turn (one user prompt and one model response); `vec` is the virtual table that stores embeddings for those turns (linked to `exchanges` by id) and is used for episodic search; `chunks` is the semantic memory table, searched on every exchange, that splits long memories into smaller chunks (not yet implemented); and `sem_vecs` is the virtual table that stores embeddings for semantic search. Then, `perm_memory` and `lessons` hold the durable facts automatically loaded into every session, `keywords` is the virtual table that indexes each turn's raw text for literal keyword matching 
 
@@ -136,9 +146,14 @@ space.
 
 - Cost / usage tracking
 - Episodic memory promotion
+    - Every N turns
+    - If episodic search empty, search semantic
+    - summarize topics and put into semantic so it has some semblance to what we talked about
 - UI
 - Redundant id in perm mem
 - Caching
 - Compaction
 - "pull more" if context pulled from episodic is not enough. documen in episodic mem fixes.
 - tool names
+- Retrieval Gate?
+- Keyword in semantic search

@@ -3,7 +3,7 @@ import anthropic
 from pathlib import Path
 from dotenv import load_dotenv
 import os
-from memory.vector_store import add_chat, mem_search, load_perm_mem, store_perm_mem, keyword_search, rrf, add_semantic_memory, semantic_search
+from memory.vector_store import add_chat, load_perm_mem, store_perm_mem, keyword_search, rrf, add_semantic_memory, semantic_search
 
 load_dotenv(Path(__file__).parent / "config" / ".env")
 api_key=os.getenv("ANTHROPIC_API_KEY")
@@ -64,11 +64,19 @@ search_semantic_mem = {
     "input_schema": {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "What to search for. Generated based on but not worded exactly like the user prompt"}
+            "query": {"type": "string", "description": "What to search for. Generated based on but not worded exactly like the user prompt"},
+            "keywords": {"type": "array", "items": {"type": "string"}, "maxItems": 2, "description": "One word, most important keyword. MUST be relevant to topic. No filler words. Second keyword optional"}
         },
-        "required": ["query"]
+        "required": ["query", 'keywords']
     }
 }
+
+def _recall_pipeline(connection, model, query, keywords, exclude_ids, vec_table, keyword_table, content_table, text_column, top_k, session_column=None, turn_column=None):
+    sem_ids = semantic_search(connection, model, query, exclude_ids, vec_table, content_table, top_k=top_k)
+    kw_ids = keyword_search(connection, keyword_table, exclude_ids, keywords)
+    combined = rrf(connection, sem_ids, kw_ids, content_table, text_column, session_column, turn_column)
+    return combined
+
 
 def format_conversation(messages):
     lines = []
@@ -97,6 +105,7 @@ def chat(connection, model):
     session_id = uuid.uuid4()
     messages = []
     seen_chunk_ids = set()
+    seen_exchanges_ids = set()
 
     print("Type 'exit' to end chat\n")
 
@@ -174,19 +183,27 @@ def chat(connection, model):
                             used_recall_memory = True
                             print("Attempting to pull from memory\n")
                             print(f"DEBUG: raw tool_use input query={object.input['query']!r}, keywords={object.input['keywords']!r}")
-                            sem_search_results = mem_search(connection, model, object.input["query"])
-                            print(f"DEBUG: vec search ids = {sem_search_results}")
-                            keyword_search_results = keyword_search(connection, object.input["keywords"])
-                            print(f"DEBUG: keyword search ids = {keyword_search_results}")
-                            combined = rrf(connection, sem_search_results, keyword_search_results)
-                            print(f"DEBUG: rrf merged results = {[(sid, ti, sc) for (_, sid, ti, sc) in combined]}")
+                            combined = _recall_pipeline(connection, model, object.input["query"], object.input["keywords"], seen_exchanges_ids, "vec", "keywords", "exchanges", "exchange", 15, "session_id", "turn_index")
                             if combined:
                                 result_text = "\n---\n".join(
                                     f"[Memory {i+1}, score={score:.4f}]\n{exchange_text}"
-                                    for i, (exchange_text, result_session_id, result_turn_index, score) in enumerate(combined)
+                                    for i, (exchange_text, result_session_id, result_turn_index, score, result_rowids) in enumerate(combined)
                                 )
+
+                                for _, _, _, _, result_rowids in combined:
+                                    seen_exchanges_ids.update(result_rowids)
+
                             else:
-                                result_text = "No relevant memories found."
+                                # Empty here is ambiguous: it could mean nothing relevant
+                                # exists, or that the only relevant memories were already
+                                # surfaced earlier this conversation and got excluded by
+                                # seen_exchanges_ids. Re-run unfiltered (no exclusions) to
+                                # tell the two cases apart before answering.
+                                unfiltered = _recall_pipeline(connection, model, object.input["query"], object.input["keywords"], set(), "vec", "keywords", "exchanges", "exchange", 15, "session_id", "turn_index")
+                                if unfiltered:
+                                    result_text = "No new memories -- the only relevant memory/memories were already surfaced earlier in this conversation. Refer back to what was already said instead of claiming nothing was found."
+                                else:
+                                    result_text = "No relevant memories found."
 
                         elif object.name == "store_perm_mem":
                             print(f"Storing permanent memory: {object.input["fact"]}\n")
@@ -209,13 +226,25 @@ def chat(connection, model):
 
                         elif object.name == "search_semantic":
                             print(f"Searching semantic memory\n")
-                            semantic_results = semantic_search(connection, model, object.input["query"], seen_chunk_ids)
-                            print(f"DEBUG: semantic search results (chunk, score) = {[(chunk, score) for chunk, score, _ in semantic_results]}\n")
-                            result_text = "\n---\n".join(
-                                f"[Memory {i+1}, score={score:.4f}]\n{chunk}"
-                                for i, (chunk, score, id) in enumerate(semantic_results)
-                            )
-                            seen_chunk_ids.update(chunk_id for _, _, chunk_id in semantic_results)
+                            combined = _recall_pipeline(connection, model, object.input["query"], object.input["keywords"], seen_chunk_ids, "sem_vecs", "sem_keywords", "chunks", "chunk", 2)
+                            if combined:
+                                result_text = "\n---\n".join(
+                                    f"[Memory {i+1}, score={score:.4f}]\n{text}"
+                                    for i, (text, result_session_id, result_turn_index, score, result_rowids) in enumerate(combined)
+                                )
+
+                                for _, _, _, _, result_rowids in combined:
+                                    seen_chunk_ids.update(result_rowids)
+
+                            else:
+                                # See recall_memory above: distinguish a true miss from
+                                # everything relevant already having been surfaced and
+                                # excluded via seen_chunk_ids.
+                                unfiltered = _recall_pipeline(connection, model, object.input["query"], object.input["keywords"], set(), "sem_vecs", "sem_keywords", "chunks", "chunk", 2)
+                                if unfiltered:
+                                    result_text = "No new memories -- the only relevant memory/memories were already surfaced earlier in this conversation. Refer back to what was already said instead of claiming nothing was found."
+                                else:
+                                    result_text = "No relevant memories found."
 
                         tool_result_blocks.append({
                             "type": "tool_result",
